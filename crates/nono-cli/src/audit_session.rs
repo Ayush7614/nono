@@ -233,7 +233,7 @@ fn build_session_info(dir: PathBuf, metadata: SessionMetadata) -> SessionInfo {
     let pid = parse_pid_from_session_id(&metadata.session_id);
     let is_alive = pid.map(is_process_alive).unwrap_or(false);
     let is_stale = metadata.ended.is_none() && !is_alive;
-    let disk_size = calculate_dir_size(&dir);
+    let disk_size = state_paths::calculate_dir_size(&dir);
 
     SessionInfo {
         metadata,
@@ -267,10 +267,6 @@ fn parse_pid_from_session_id(session_id: &str) -> Option<u32> {
 fn is_process_alive(pid: u32) -> bool {
     // SAFETY: POSIX kill(pid, 0) checks process existence without sending a signal.
     unsafe { nix::libc::kill(pid as nix::libc::pid_t, 0) == 0 }
-}
-
-fn calculate_dir_size(dir: &Path) -> u64 {
-    crate::state_paths::calculate_dir_size(dir)
 }
 
 #[cfg(test)]
@@ -622,71 +618,5 @@ mod tests {
             resolve_session_dir("20260813-120000-4242"),
             Err(NonoError::AuditSessionOutsideRoot { .. })
         ));
-    }
-
-    #[test]
-    fn calculate_dir_size_counts_regular_files() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), b"hello").unwrap();
-        fs::write(dir.path().join("b.txt"), b"world!").unwrap();
-        assert_eq!(calculate_dir_size(dir.path()), 11);
-    }
-
-    #[test]
-    fn calculate_dir_size_does_not_follow_symlinked_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let real_sub = dir.path().join("real");
-        fs::create_dir_all(&real_sub).unwrap();
-        fs::write(real_sub.join("file.txt"), b"hello").unwrap();
-        let link = dir.path().join("link_to_real");
-        std::os::unix::fs::symlink(&real_sub, &link).unwrap();
-        // WalkDir with follow_links(false) should see the symlink itself
-        // but not descend into it, so only file in real/ counts, not via link.
-        // Total should be 5 (one file), not 10.
-        assert_eq!(calculate_dir_size(dir.path()), 5);
-    }
-
-    #[test]
-    fn calculate_dir_size_handles_broken_symlink() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("real.txt"), b"hello").unwrap();
-        let broken = dir.path().join("broken.txt");
-        std::os::unix::fs::symlink(dir.path().join("nonexistent"), &broken).unwrap();
-        // Broken symlink metadata fails; should be skipped, only real.txt counts.
-        assert_eq!(calculate_dir_size(dir.path()), 5);
-    }
-
-    #[test]
-    fn calculate_dir_size_handles_symlink_cycle_without_looping() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a");
-        let b = dir.path().join("b");
-        fs::create_dir_all(&a).unwrap();
-        fs::create_dir_all(&b).unwrap();
-        fs::write(a.join("file.txt"), b"hello").unwrap();
-        std::os::unix::fs::symlink(&b, a.join("link_to_b")).unwrap();
-        std::os::unix::fs::symlink(&a, b.join("link_to_a")).unwrap();
-        // Must terminate and not double-count; only the one real file.
-        assert_eq!(calculate_dir_size(dir.path()), 5);
-    }
-
-    #[test]
-    fn calculate_dir_size_empty_dir_is_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(calculate_dir_size(dir.path()), 0);
-    }
-
-    #[test]
-    fn calculate_dir_size_ignores_symlink_to_file_outside() {
-        let dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let outside_file = outside.path().join("outside.txt");
-        fs::write(&outside_file, b"hello").unwrap();
-        fs::write(dir.path().join("real.txt"), b"hello").unwrap();
-        let link = dir.path().join("link_to_outside.txt");
-        std::os::unix::fs::symlink(&outside_file, &link).unwrap();
-        // Symlink-to-file should not be counted (would double-count external file).
-        // Only real.txt (5) counts, not link.
-        assert_eq!(calculate_dir_size(dir.path()), 5);
     }
 }
