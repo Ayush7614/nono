@@ -3,11 +3,28 @@
 //! This module provides serialization of capability state for diagnostic purposes.
 
 use crate::capability::{
-    AccessMode, CapabilitySet, FsCapability, SocketScope, UnixSocketCapability, UnixSocketMode,
+    AccessMode, CapabilitySet, FsCapability, IpcMode, NetworkMode, ProcessInfoMode, SignalMode,
+    SocketScope, UnixSocketCapability, UnixSocketMode,
 };
 use crate::resource::ResourceLimits;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_signal_default(m: &SignalMode) -> bool {
+    *m == SignalMode::Isolated
+}
+
+fn is_process_info_default(m: &ProcessInfoMode) -> bool {
+    *m == ProcessInfoMode::Isolated
+}
+
+fn is_ipc_default(m: &IpcMode) -> bool {
+    *m == IpcMode::SharedMemoryOnly
+}
 
 /// Serializable representation of sandbox state
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,12 +35,54 @@ pub struct SandboxState {
     /// by older nono builds; `#[serde(default)]` preserves backward compat).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unix_sockets: Vec<UnixSocketCapState>,
-    /// Whether network is blocked
+    /// Whether network is blocked (legacy field for backward compat).
+    /// New states also set `network_mode`; old states lacking `network_mode`
+    /// fall back to this boolean.
     pub net_blocked: bool,
+    /// Precise network mode. Present in states written by new builds;
+    /// absent in legacy states (where `net_blocked` is used instead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_mode: Option<NetworkMode>,
     /// Whether implicit macOS DNS resolver grants are disabled.
     /// Older states retain their original DNS-enabled behavior.
     #[serde(default)]
     pub dns_blocked: bool,
+    /// Per-port TCP connect allowlist (Linux Landlock V4+).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tcp_connect_ports: Vec<u16>,
+    /// Per-port TCP bind allowlist (Linux Landlock V4+).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tcp_bind_ports: Vec<u16>,
+    /// Bidirectional localhost IPC ports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub localhost_ports: Vec<u16>,
+    /// Bidirectional localhost IPC port ranges (inclusive).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub localhost_port_ranges: Vec<(u16, u16)>,
+    /// Signal isolation mode.
+    #[serde(default, skip_serializing_if = "is_signal_default")]
+    pub signal_mode: SignalMode,
+    /// Process inspection mode.
+    #[serde(default, skip_serializing_if = "is_process_info_default")]
+    pub process_info_mode: ProcessInfoMode,
+    /// IPC mode.
+    #[serde(default, skip_serializing_if = "is_ipc_default")]
+    pub ipc_mode: IpcMode,
+    /// Whether sandbox extensions are enabled.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub extensions_enabled: bool,
+    /// Whether macOS Seatbelt denial logging is enabled.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub seatbelt_debug_deny: bool,
+    /// Commands explicitly allowed (overrides blocklists).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_commands: Vec<String>,
+    /// Commands explicitly blocked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_commands: Vec<String>,
+    /// Raw platform-specific Seatbelt rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platform_rules: Vec<String>,
     /// Resource ceilings (memory and max processes). Absent in states from older
     /// nono builds; `#[serde(default)]` keeps those loadable. Plain numbers, so
     /// unlike paths they need no re-validation.
@@ -88,7 +147,20 @@ impl SandboxState {
                 })
                 .collect(),
             net_blocked: caps.is_network_blocked(),
+            network_mode: Some(caps.network_mode().clone()),
             dns_blocked: !caps.dns_enabled(),
+            tcp_connect_ports: caps.tcp_connect_ports().to_vec(),
+            tcp_bind_ports: caps.tcp_bind_ports().to_vec(),
+            localhost_ports: caps.localhost_ports().to_vec(),
+            localhost_port_ranges: caps.localhost_port_ranges().to_vec(),
+            signal_mode: caps.signal_mode(),
+            process_info_mode: caps.process_info_mode(),
+            ipc_mode: caps.ipc_mode(),
+            extensions_enabled: caps.extensions_enabled(),
+            seatbelt_debug_deny: caps.seatbelt_debug_deny(),
+            allowed_commands: caps.allowed_commands().to_vec(),
+            blocked_commands: caps.blocked_commands().to_vec(),
+            platform_rules: caps.platform_rules().to_vec(),
             resource_limits: caps.resource_limits().copied(),
         }
     }
@@ -174,9 +246,49 @@ impl SandboxState {
             caps.add_unix_socket(cap);
         }
 
-        caps.set_network_blocked(self.net_blocked);
+        // Prefer precise network_mode when present; fall back to legacy
+        // net_blocked boolean for states written by older builds.
+        if let Some(mode) = &self.network_mode {
+            caps.set_network_mode_mut(mode.clone());
+        } else {
+            caps.set_network_blocked(self.net_blocked);
+        }
         if self.dns_blocked {
             caps = caps.block_dns();
+        }
+
+        for port in &self.tcp_connect_ports {
+            caps.add_tcp_connect_port(*port);
+        }
+        for port in &self.tcp_bind_ports {
+            caps.add_tcp_bind_port(*port);
+        }
+        for port in &self.localhost_ports {
+            caps.add_localhost_port(*port);
+        }
+        for (start, end) in &self.localhost_port_ranges {
+            caps.add_localhost_port_range(*start, *end)?;
+        }
+
+        caps.set_signal_mode_mut(self.signal_mode);
+        caps.set_process_info_mode_mut(self.process_info_mode);
+        caps.set_ipc_mode_mut(self.ipc_mode);
+
+        if self.extensions_enabled {
+            caps = caps.enable_extensions();
+        }
+        if self.seatbelt_debug_deny {
+            caps.set_seatbelt_debug_deny(true);
+        }
+
+        for cmd in &self.allowed_commands {
+            caps.add_allowed_command(cmd.clone());
+        }
+        for cmd in &self.blocked_commands {
+            caps.add_blocked_command(cmd.clone());
+        }
+        for rule in &self.platform_rules {
+            caps.add_platform_rule(rule.clone())?;
         }
 
         if let Some(limits) = self.resource_limits {
@@ -446,5 +558,214 @@ mod tests {
             state.to_caps().is_err(),
             "to_caps must reject unknown unix socket modes"
         );
+    }
+
+    #[test]
+    fn test_network_mode_proxy_only_roundtrip() -> crate::error::Result<()> {
+        let caps = CapabilitySet::new().proxy_only(8080);
+        let state = SandboxState::from_caps(&caps);
+        assert_eq!(
+            state.network_mode,
+            Some(crate::capability::NetworkMode::ProxyOnly {
+                port: 8080,
+                bind_ports: Vec::new()
+            })
+        );
+        // net_blocked stays true for backward compat
+        assert!(state.net_blocked);
+        let json = state.to_json()?;
+        let restored = SandboxState::from_json(&json)
+            .map_err(|e| crate::error::NonoError::ConfigParse(e.to_string()))?
+            .to_caps()?;
+        assert_eq!(restored.network_mode(), caps.network_mode());
+        assert_eq!(restored.is_network_blocked(), caps.is_network_blocked());
+        Ok(())
+    }
+
+    #[test]
+    fn test_network_mode_proxy_only_with_bind_ports_roundtrip() -> crate::error::Result<()> {
+        let caps = CapabilitySet::new().proxy_only_with_bind(9090, vec![3000, 3001]);
+        let state = SandboxState::from_caps(&caps);
+        let json = state.to_json()?;
+        let restored = SandboxState::from_json(&json)
+            .map_err(|e| crate::error::NonoError::ConfigParse(e.to_string()))?
+            .to_caps()?;
+        assert_eq!(restored.network_mode(), caps.network_mode());
+        Ok(())
+    }
+
+    #[test]
+    fn test_network_mode_blocked_and_allow_all_roundtrip() -> crate::error::Result<()> {
+        for caps in [CapabilitySet::new().block_network(), CapabilitySet::new()] {
+            let state = SandboxState::from_caps(&caps);
+            let json = state.to_json()?;
+            let restored = SandboxState::from_json(&json)
+                .map_err(|e| crate::error::NonoError::ConfigParse(e.to_string()))?
+                .to_caps()?;
+            assert_eq!(restored.network_mode(), caps.network_mode());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_legacy_proxy_only_collapse_fixed() -> crate::error::Result<()> {
+        // Legacy JSON has net_blocked=true but no network_mode (old writer).
+        // It must still deserialize and fallback to Blocked (not ProxyOnly),
+        // but new writer must not collapse ProxyOnly to Blocked.
+        let legacy_json = r#"{ "fs": [], "net_blocked": true }"#;
+        let legacy = SandboxState::from_json(legacy_json)
+            .map_err(|e| crate::error::NonoError::ConfigParse(e.to_string()))?
+            .to_caps()?;
+        // Legacy with only net_blocked=true becomes Blocked (cannot infer ProxyOnly)
+        assert_eq!(
+            legacy.network_mode(),
+            &crate::capability::NetworkMode::Blocked
+        );
+
+        // New writer preserves ProxyOnly distinctly
+        let caps = CapabilitySet::new().proxy_only(7070);
+        let state = SandboxState::from_caps(&caps);
+        let json = state.to_json()?;
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v.get("network_mode").is_some(),
+            "new state must include network_mode"
+        );
+        let restored = SandboxState::from_json(&json)
+            .map_err(|e| crate::error::NonoError::ConfigParse(e.to_string()))?
+            .to_caps()?;
+        assert_eq!(
+            restored.network_mode(),
+            &crate::capability::NetworkMode::ProxyOnly {
+                port: 7070,
+                bind_ports: vec![]
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_localhost_and_tcp_ports_roundtrip() -> crate::error::Result<()> {
+        let caps = CapabilitySet::new()
+            .allow_localhost_port(3000)
+            .allow_localhost_port(3001)
+            .allow_tcp_connect(443)
+            .allow_tcp_bind(8080);
+        let caps = caps.allow_localhost_port_range(4000, 4005).expect("range");
+        let state = SandboxState::from_caps(&caps);
+        assert_eq!(state.localhost_ports, vec![3000, 3001]);
+        assert_eq!(state.tcp_connect_ports, vec![443]);
+        assert_eq!(state.tcp_bind_ports, vec![8080]);
+        assert_eq!(state.localhost_port_ranges, vec![(4000, 4005)]);
+        let json = state.to_json()?;
+        let restored = SandboxState::from_json(&json)
+            .map_err(|e| crate::error::NonoError::ConfigParse(e.to_string()))?
+            .to_caps()?;
+        assert_eq!(restored.localhost_ports(), caps.localhost_ports());
+        assert_eq!(restored.tcp_connect_ports(), caps.tcp_connect_ports());
+        assert_eq!(restored.tcp_bind_ports(), caps.tcp_bind_ports());
+        assert_eq!(
+            restored.localhost_port_ranges(),
+            caps.localhost_port_ranges()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_signal_and_ipc_modes_roundtrip() -> crate::error::Result<()> {
+        let caps = CapabilitySet::new()
+            .set_signal_mode(crate::capability::SignalMode::AllowAll)
+            .set_process_info_mode(crate::capability::ProcessInfoMode::AllowAll)
+            .set_ipc_mode(crate::capability::IpcMode::Full);
+        let state = SandboxState::from_caps(&caps);
+        let json = state.to_json()?;
+        let restored = SandboxState::from_json(&json)
+            .map_err(|e| crate::error::NonoError::ConfigParse(e.to_string()))?
+            .to_caps()?;
+        assert_eq!(restored.signal_mode(), caps.signal_mode());
+        assert_eq!(restored.process_info_mode(), caps.process_info_mode());
+        assert_eq!(restored.ipc_mode(), caps.ipc_mode());
+        Ok(())
+    }
+
+    #[test]
+    fn test_commands_and_platform_rules_roundtrip() -> crate::error::Result<()> {
+        let caps = CapabilitySet::new()
+            .allow_command("cargo")
+            .block_command("curl")
+            .platform_rule("(allow file-read* (subpath \"/tmp\"))".to_string())
+            .expect("platform rule");
+        // need to set enable_extensions
+        let caps = caps.enable_extensions();
+        let mut caps = caps;
+        caps.set_seatbelt_debug_deny(true);
+        let state = SandboxState::from_caps(&caps);
+        assert_eq!(state.allowed_commands, vec!["cargo"]);
+        assert_eq!(state.blocked_commands, vec!["curl"]);
+        assert_eq!(
+            state.platform_rules,
+            vec!["(allow file-read* (subpath \"/tmp\"))"]
+        );
+        assert!(state.extensions_enabled);
+        assert!(state.seatbelt_debug_deny);
+        let json = state.to_json()?;
+        let restored = SandboxState::from_json(&json)
+            .map_err(|e| crate::error::NonoError::ConfigParse(e.to_string()))?
+            .to_caps()?;
+        assert_eq!(restored.allowed_commands(), caps.allowed_commands());
+        assert_eq!(restored.blocked_commands(), caps.blocked_commands());
+        assert_eq!(restored.platform_rules(), caps.platform_rules());
+        assert_eq!(restored.extensions_enabled(), caps.extensions_enabled());
+        assert_eq!(restored.seatbelt_debug_deny(), caps.seatbelt_debug_deny());
+        Ok(())
+    }
+
+    #[test]
+    fn test_legacy_state_without_new_fields_still_loads() -> crate::error::Result<()> {
+        let json = r#"{ "fs": [], "net_blocked": false }"#;
+        let state = SandboxState::from_json(json)
+            .map_err(|e| crate::error::NonoError::ConfigParse(e.to_string()))?;
+        assert!(state.network_mode.is_none());
+        assert!(state.tcp_connect_ports.is_empty());
+        assert!(state.localhost_ports.is_empty());
+        assert_eq!(state.signal_mode, crate::capability::SignalMode::Isolated);
+        let caps = state.to_caps()?;
+        assert_eq!(
+            caps.network_mode(),
+            &crate::capability::NetworkMode::AllowAll
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_state_omits_default_fields_for_backward_compat() -> crate::error::Result<()> {
+        let caps = CapabilitySet::new();
+        let state = SandboxState::from_caps(&caps);
+        let json = state.to_json()?;
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().unwrap();
+        // Empty vec fields and default enums/bools must be omitted
+        assert!(
+            !obj.contains_key("tcp_connect_ports"),
+            "empty tcp_connect_ports should be omitted"
+        );
+        assert!(
+            !obj.contains_key("localhost_ports"),
+            "empty localhost_ports should be omitted"
+        );
+        assert!(
+            !obj.contains_key("platform_rules"),
+            "empty platform_rules should be omitted"
+        );
+        assert!(
+            !obj.contains_key("allowed_commands"),
+            "empty allowed_commands should be omitted"
+        );
+        // network_mode is Some(AllowAll) -> should be present (since it's precise)
+        assert!(
+            obj.contains_key("network_mode"),
+            "AllowAll should be serialized explicitly"
+        );
+        Ok(())
     }
 }
