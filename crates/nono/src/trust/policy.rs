@@ -339,7 +339,14 @@ fn find_files_recursive(
         let path = entry.path();
         let meta = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    "skipping unreadable trust candidate {}: {}",
+                    path.display(),
+                    e
+                );
+                continue;
+            }
         };
 
         if meta.is_dir() {

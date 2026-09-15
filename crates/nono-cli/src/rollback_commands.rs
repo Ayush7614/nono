@@ -230,7 +230,18 @@ fn get_session_total_changes(s: &SessionInfo) -> (usize, usize, usize) {
     let mut total_deleted = 0usize;
 
     for i in 1..s.metadata.snapshot_count {
-        let changes = SnapshotManager::load_changes_from(&s.dir, i).unwrap_or_default();
+        let changes = match SnapshotManager::load_changes_from(&s.dir, i) {
+            Ok(changes) => changes,
+            Err(e) => {
+                tracing::warn!(
+                    "corrupt changes {} for session {}: {}",
+                    i,
+                    s.metadata.session_id,
+                    e
+                );
+                continue;
+            }
+        };
         let (c, m, d) = count_change_types(&changes);
         total_created = total_created.saturating_add(c);
         total_modified = total_modified.saturating_add(m);
@@ -301,7 +312,25 @@ fn cmd_show(args: RollbackShowArgs) -> Result<()> {
     // Collect all changes from all snapshots
     let mut all_changes = Vec::new();
     for i in 1..session.metadata.snapshot_count {
-        let changes = SnapshotManager::load_changes_from(&session.dir, i).unwrap_or_default();
+        let changes = match SnapshotManager::load_changes_from(&session.dir, i) {
+            Ok(changes) => changes,
+            Err(e) => {
+                tracing::warn!(
+                    "corrupt changes {} for session {}: {}",
+                    i,
+                    session.metadata.session_id,
+                    e
+                );
+                eprintln!(
+                    "{} Warning: corrupt changes {} for session {}: {}",
+                    prefix(),
+                    i,
+                    session.metadata.session_id,
+                    e
+                );
+                continue;
+            }
+        };
         all_changes.extend(changes);
     }
 
@@ -355,7 +384,18 @@ fn print_change_summary(changes: &[nono::undo::Change], object_store: &ObjectSto
         let line_info = match change.change_type {
             ChangeType::Created => {
                 if let Some(hash) = &change.new_hash {
-                    let content = object_store.retrieve(hash).unwrap_or_default();
+                    let content = match object_store.retrieve(hash) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            tracing::warn!(
+                                "failed to retrieve object {} for {}: {}",
+                                hash,
+                                change.path.display(),
+                                e
+                            );
+                            Vec::new()
+                        }
+                    };
                     let lines = count_lines(&content);
                     format!("(+{lines} lines)")
                 } else {
@@ -364,7 +404,18 @@ fn print_change_summary(changes: &[nono::undo::Change], object_store: &ObjectSto
             }
             ChangeType::Deleted => {
                 if let Some(hash) = &change.old_hash {
-                    let content = object_store.retrieve(hash).unwrap_or_default();
+                    let content = match object_store.retrieve(hash) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            tracing::warn!(
+                                "failed to retrieve object {} for {}: {}",
+                                hash,
+                                change.path.display(),
+                                e
+                            );
+                            Vec::new()
+                        }
+                    };
                     let lines = count_lines(&content);
                     format!("(-{lines} lines)")
                 } else {
@@ -570,9 +621,28 @@ fn print_show_json(session: &SessionInfo) -> Result<()> {
     for i in 0..session.metadata.snapshot_count {
         let manifest = match SnapshotManager::load_manifest_from(&session.dir, i) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    "corrupt manifest {} for session {}: {}",
+                    i,
+                    session.metadata.session_id,
+                    e
+                );
+                continue;
+            }
         };
-        let changes = SnapshotManager::load_changes_from(&session.dir, i).unwrap_or_default();
+        let changes = match SnapshotManager::load_changes_from(&session.dir, i) {
+            Ok(changes) => changes,
+            Err(e) => {
+                tracing::warn!(
+                    "corrupt changes {} for session {}: {}",
+                    i,
+                    session.metadata.session_id,
+                    e
+                );
+                Vec::new()
+            }
+        };
 
         snapshots.push(serde_json::json!({
             "number": manifest.number,

@@ -94,9 +94,13 @@ fn filter_path(path_value: &str, mut keep: impl FnMut(&Path) -> bool) -> String 
     let kept: Vec<PathBuf> = std::env::split_paths(path_value)
         .filter(|entry| keep(entry))
         .collect();
-    std::env::join_paths(kept)
-        .map(|joined| joined.to_string_lossy().into_owned())
-        .unwrap_or_default()
+    match std::env::join_paths(kept) {
+        Ok(joined) => joined.to_string_lossy().into_owned(),
+        Err(e) => {
+            tracing::warn!("failed to join sanitized PATH: {}", e);
+            String::new()
+        }
+    }
 }
 
 fn is_entry_safe(entry: &Path, outer_caps: &CapabilitySet) -> bool {
